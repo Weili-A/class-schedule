@@ -171,6 +171,7 @@ h2 { font-size: 17px; margin: 2px 0 10px; }
   border-radius: 12px; padding: 11px 14px; cursor: pointer;
 }
 .btn:active { transform: scale(0.985); opacity: 0.85; }
+.btn:disabled { opacity: 0.45; pointer-events: none; }
 .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn-danger { color: var(--danger); border-color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
 .btn-block { margin-bottom: 10px; }
@@ -179,7 +180,7 @@ h2 { font-size: 17px; margin: 2px 0 10px; }
 
 .form-card label.field { display: block; margin-bottom: 12px; }
 .field span { display: block; font-size: 13px; color: var(--text-2); margin-bottom: 5px; }
-.field input, .form-card select, .modal input[type="text"], .modal input[type="date"], .modal input[type="time"], .modal input[type="number"], .modal textarea, .modal select {
+.field input, .form-card select, .form-card textarea, .modal input[type="text"], .modal input[type="date"], .modal input[type="time"], .modal input[type="number"], .modal textarea, .modal select {
   width: 100%;
   background: var(--bg);
   border: 1px solid var(--line);

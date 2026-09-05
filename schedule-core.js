@@ -345,6 +345,55 @@
     return 0;
   }
 
+  /* ================= 节次 -> 时间（作息时间表） ================= */
+
+  // 默认作息时间表（可在设置中修改；每行一条：第X-Y节 开始-结束）。
+  // 各校作息不同，粘贴“第X-Y节”课表前请先在“设置 → 作息时间表”里核对
+  var DEFAULT_PERIOD_TIMES =
+    '第1-2节 08:00-09:40\n' +
+    '第3-4节 10:00-11:40\n' +
+    '第5-6节 14:00-15:40\n' +
+    '第7-8节 16:00-17:40\n' +
+    '第9-10节 19:00-20:40\n' +
+    '第11-12节 20:50-22:30';
+
+  // 解析作息表文本 -> [{from,to,start,end}]（start/end 为分钟）；非法行静默忽略
+  function parsePeriodTable(text) {
+    var src = (text == null || String(text).trim() === '') ? DEFAULT_PERIOD_TIMES : String(text);
+    var rows = src.split(/\r?\n/);
+    var out = [];
+    rows.forEach(function (raw) {
+      var t = normalizeLineText(raw).trim();
+      if (!t) return;
+      var m = /^(?:第)?\s*(\d{1,2})\s*[-~至]\s*(\d{1,2})\s*节?\s*(\d{1,2}):(\d{2})\s*[-~至]\s*(\d{1,2}):(\d{2})$/.exec(t);
+      if (!m) return; // 只认“第X-Y节 HH:MM-HH:MM”形态（分隔空格可省略），其余行忽略
+      var from = +m[1], to = +m[2];
+      var s = timeToMinutes(m[3] + ':' + m[4]);
+      var e = timeToMinutes(m[5] + ':' + m[6]);
+      if (!(from >= 1 && to >= from && to <= 30)) return;
+      if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) return;
+      out.push({ from: from, to: to, start: s, end: e });
+    });
+    return out;
+  }
+
+  // “第X-Y节” -> {start, end}（分钟）；作息表里找不到对应条目返回 null
+  // 先找精确条目（如 1-2），再允许跨条目拼接（如 第1-4节 = 1-2 的开始 + 3-4 的结束）
+  function resolvePeriods(x, y, table) {
+    if (!(x >= 1 && y >= x && y <= 30)) return null;
+    var tb = (table && table.length) ? table : parsePeriodTable('');
+    for (var i = 0; i < tb.length; i++) {
+      if (tb[i].from === x && tb[i].to === y) return { start: tb[i].start, end: tb[i].end };
+    }
+    var rs = null, re = null;
+    for (var j = 0; j < tb.length; j++) {
+      if (tb[j].from === x) rs = tb[j];
+      if (tb[j].to === y) re = tb[j];
+    }
+    if (rs && re) return { start: rs.start, end: re.end };
+    return null;
+  }
+
   /* ================= 调休 / 停课覆盖 ================= */
   // override 结构：
   //   { id, type:'cancel'|'shift', start:'YYYY-MM-DD', end:'YYYY-MM-DD'(默认=start), targetDay:1-7(仅shift), label }
@@ -414,18 +463,31 @@
 
     // 补课（shift）：默认当天整体按 targetDay 的课表上；
     // 可选 keepOwn 保留当天原有课程；可选 sourceWeek 按指定周次判断单双（如“补第4周周一的课”）
-    var dayMatch = [dayOfWeek];
-    var matchWeek = week;
+    var shiftTarget = null;
+    var sourceWeek = null;
     if (ov && ov.type === 'shift') {
-      dayMatch = [Math.round(+ov.targetDay) || dayOfWeek];
-      if (ov.keepOwn && dayMatch[0] !== dayOfWeek) dayMatch.push(dayOfWeek);
-      if (ov.sourceWeek) matchWeek = Math.min(40, Math.max(1, Math.round(+ov.sourceWeek)));
+      shiftTarget = Math.min(7, Math.max(1, Math.round(+ov.targetDay) || dayOfWeek));
+      if (ov.sourceWeek) sourceWeek = Math.min(40, Math.max(1, Math.round(+ov.sourceWeek)));
     }
 
     var list = [];
     (courses || []).forEach(function (c) {
       if (!c) return;
-      if (dayMatch.indexOf((+c.dayOfWeek || 0)) < 0) return;
+      var dow = +c.dayOfWeek || 0;
+      var matchWeek = week;
+      if (ov && ov.type === 'shift') {
+        if (dow === shiftTarget) {
+          // 被补进来的课：单双跟随 sourceWeek（未填则跟随真实周次）
+          matchWeek = sourceWeek || week;
+        } else if (dow === dayOfWeek && ov.keepOwn && shiftTarget !== dayOfWeek) {
+          // 保留的当天原课：永远按真实周次求单双，不受 sourceWeek 影响
+          // （否则“周六双周课 + 补第5周周的单周课”会把原课误杀）
+        } else {
+          return;
+        }
+      } else if (dow !== dayOfWeek) {
+        return;
+      }
       if (!matchesWeek(c.weekRule, matchWeek, cfg.firstWeekOdd)) return;
       list.push(c);
     });
@@ -434,9 +496,9 @@
     return {
       date: iso,
       week: week,
-      matchWeek: matchWeek !== week ? matchWeek : null,
+      matchWeek: (sourceWeek && sourceWeek !== week) ? sourceWeek : null,
       dayOfWeek: dayOfWeek,
-      effectiveDay: ov && ov.type === 'shift' ? dayMatch[0] : dayOfWeek,
+      effectiveDay: shiftTarget || dayOfWeek,
       overriddenBy: ov || null,
       reason: 'ok',
       courses: list
@@ -599,9 +661,13 @@
     }
     var cleanCourses = st.courses.map(function (c) { return sanitizeCourse(c); });
     var cleanOverrides = [];
+    var seenOvIds = {};
     st.overrides.forEach(function (o) {
       var so = sanitizeOverride(o);
-      if (so) cleanOverrides.push(so);
+      if (!so) return;
+      if (seenOvIds[so.id]) return; // 重复 id 会导致删除/编辑命中多条，导入时去重
+      seenOvIds[so.id] = true;
+      cleanOverrides.push(so);
     });
     return {
       state: {
@@ -629,17 +695,19 @@
       .replace(/\r?\n/g, '\\n');
   }
 
+  var UTF8_ENCODER = null;
   // RFC 5545 行折叠：每行最多 75 字节（UTF-8，含续行的前导空格），续行以空格开头。
   // 按 Unicode 码点迭代，避免在 emoji 等代理对中间折行导致内容损坏
   function foldLine(line) {
-    var enc = new TextEncoder();
+    if (!UTF8_ENCODER && typeof TextEncoder !== 'undefined') UTF8_ENCODER = new TextEncoder();
+    var enc = UTF8_ENCODER;
     var lines = [];
     var cur = '';
     var curBytes = 0;
     var chars = Array.from(line);
     for (var i = 0; i < chars.length; i++) {
       var ch = chars[i];
-      var b = enc.encode(ch).length;
+      var b = enc ? enc.encode(ch).length : 2; // 无 TextEncoder 的环境按常见中文宽度估算，仅影响折行点
       var limit = lines.length === 0 ? 75 : 74; // 续行多一个前导空格
       if (curBytes + b > limit) {
         lines.push(cur);
@@ -670,7 +738,8 @@
   function buildICS(courses, config, opts) {
     var cfg = config || {};
     var o = opts || {};
-    var alarmMinutes = Math.min(120, Math.max(0, Math.round(+o.alarmMinutes || 15)));
+    var alarmRaw = Math.round(+o.alarmMinutes);
+    var alarmMinutes = Number.isFinite(alarmRaw) ? Math.min(120, Math.max(0, alarmRaw)) : 15; // 0 = 上课瞬间提醒，不能被 || 当成缺省
     var s = parseISO(cfg.semesterStart);
     if (!s) return { ics: null, count: 0, error: '请先设置学期开始日期' };
     var total = Math.max(1, Math.round(+cfg.totalWeeks || 20));
@@ -715,7 +784,7 @@
           lines.push('BEGIN:VALARM');
           lines.push('ACTION:DISPLAY');
           lines.push(foldLine('DESCRIPTION:' + icsEscape((alarmMinutes > 0 ? '还有 ' + alarmMinutes + ' 分钟上课' : '要上课了') + '：' + c.name + (c.location ? ' @ ' + c.location : ''))));
-          lines.push('TRIGGER:-PT' + Math.max(1, alarmMinutes) + 'M');
+          lines.push('TRIGGER:-PT' + alarmMinutes + 'M');
           lines.push('END:VALARM');
           lines.push('END:VEVENT');
           count++;
@@ -750,6 +819,146 @@
     ];
   }
 
+  /* ================= 批量导入（粘贴文本解析） ================= */
+
+  var FULLWIDTH_MAP = { '，': ',', '、': ',', '：': ':', '；': ';', '～': '-', '—': '-', '－': '-', '–': '-' };
+
+  function normalizeLineText(s) {
+    var out = String(s == null ? '' : s).replace(/[\u3000]/g, ' ');
+    for (var k in FULLWIDTH_MAP) {
+      if (Object.prototype.hasOwnProperty.call(FULLWIDTH_MAP, k)) {
+        out = out.split(k).join(FULLWIDTH_MAP[k]);
+      }
+    }
+    return out;
+  }
+
+  // 解析一段粘贴文本：每行一门课。返回 {courses, errors:[{line,text,reason}]}
+  // 支持两种常见顺序（全角标点自动兼容）：
+  //   A: 高等数学 周一 08:00-09:40 教三201 单周 [张老师]
+  //   B: 周一 08:00-09:40 高等数学 教三201 单周
+  // 时间也支持“第X-Y节”写法（经 config.periodTimes 作息表换算，如“高数 周二 第1-2节 教三201 1-18周”）
+  // 周规则可省略（=每周）；支持 每周/单周/双周/前4周/第5-8周/1-16周/第2,3,5-7周 等
+  function parseScheduleLines(text, config) {
+    var cfg = config || {};
+    var tw = Math.max(1, Math.round(+cfg.totalWeeks || 20));
+    var fo = cfg.firstWeekOdd !== false;
+    var periodTable = parsePeriodTable(cfg.periodTimes);
+    var rawLines = String(text == null ? '' : text).split(/\r?\n/);
+    var courses = [];
+    var errors = [];
+
+    rawLines.forEach(function (raw, idx) {
+      var lineNo = idx + 1;
+      var t = normalizeLineText(raw).trim();
+      if (!t) return;
+
+      // 星期几
+      var dayM = /(?:周|星期)\s*([一二三四五六日天1-7])/.exec(t);
+      if (!dayM) { errors.push({ line: lineNo, text: raw.trim(), reason: '缺少星期几（如 周一）' }); return; }
+      var dayMap = { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '日': 7, '天': 7 };
+      var dayOfWeek = dayMap[dayM[1]] || Math.round(+dayM[1]);
+      if (!(dayOfWeek >= 1 && dayOfWeek <= 7)) {
+        errors.push({ line: lineNo, text: raw.trim(), reason: '星期几无法识别' });
+        return;
+      }
+
+      // 节次（第X-Y节 / 第X节）：先从行里摘出，避免被误当成周次规则；
+      // 行内没有具体时间时，用“设置 → 作息时间表”换算
+      var perM = /(?:第)?\s*(\d{1,2})\s*[-~至]\s*(\d{1,2})\s*节/.exec(t);
+      if (perM) {
+        t = t.replace(perM[0], ' ');
+      } else {
+        var perSingle = /(?:第)?\s*(\d{1,2})\s*节/.exec(t);
+        if (perSingle) { perM = perSingle; t = t.replace(perSingle[0], ' '); }
+      }
+
+      // 时间范围
+      var timeM = /(\d{1,2}):(\d{2})\s*[-~至]\s*(\d{1,2}):(\d{2})/.exec(t);
+      var startTime = null;
+      var endTime = null;
+      if (timeM) {
+        startTime = String(+timeM[1]).padStart(2, '0') + ':' + timeM[2];
+        endTime = String(+timeM[3]).padStart(2, '0') + ':' + timeM[4];
+      } else if (perM) {
+        var per = resolvePeriods(+perM[1], +perM[2], periodTable);
+        if (!per) {
+          errors.push({ line: lineNo, text: raw.trim(), reason: '作息表里没有第' + perM[1] + '-' + perM[2] + '节的时间，请到“设置 → 作息时间表”核对' });
+          return;
+        }
+        startTime = minutesToTime(per.start);
+        endTime = minutesToTime(per.end);
+      } else {
+        errors.push({ line: lineNo, text: raw.trim(), reason: '缺少时间范围（如 08:00-09:40 或 第1-2节）' });
+        return;
+      }
+      if (timeToMinutes(endTime) <= timeToMinutes(startTime)) {
+        errors.push({ line: lineNo, text: raw.trim(), reason: '结束时间必须晚于开始时间' });
+        return;
+      }
+
+      // 去掉星期与时间段，剩余 token 化
+      var rest = t.replace(dayM[0], ' ');
+      if (timeM) rest = rest.replace(timeM[0], ' ');
+      var tokens = rest.split(/[\s,，、]+/).filter(function (x) { return x; });
+
+      // 周规则：取最后一个能解析成功的 token（"教三201"这类不会被误判）
+      var ruleTokenIdx = -1;
+      for (var i = tokens.length - 1; i >= 0; i--) {
+        if (!parseWeekRule(tokens[i], tw, fo).error) { ruleTokenIdx = i; break; }
+      }
+      var weekRule;
+      if (ruleTokenIdx >= 0) {
+        weekRule = parseWeekRule(tokens[ruleTokenIdx], tw, fo).rule;
+        tokens.splice(ruleTokenIdx, 1);
+      } else {
+        weekRule = { type: 'all', start: 1, end: tw }; // 未写周规则 = 每周
+      }
+
+      // 教师：以“老师/教师”结尾的 token（兼容课表里的“虚拟教师”）
+      var teacher = '';
+      for (var j = tokens.length - 1; j >= 0; j--) {
+        if (/(?:老师|教师)$/.test(tokens[j])) { teacher = tokens[j]; tokens.splice(j, 1); break; }
+      }
+
+      // 名称与地点：名称在星期前（A 顺序）或紧跟在时间后（B 顺序）
+      var name = '';
+      var location = '';
+      var beforeDay = t.slice(0, t.indexOf(dayM[0])).trim();
+      if (beforeDay && !/\d{1,2}:\d{2}/.test(beforeDay)) {
+        name = beforeDay.replace(/[\s,，、;；]+$/, '');
+        // A 顺序：tokens 里也包含名称 token，剔除它（按 token 逐一过滤，兼容带空格的名称）
+        var nameTokens = name.split(/[\s,，、]+/).filter(function (x) { return x; });
+        location = tokens.filter(function (x) { return nameTokens.indexOf(x) < 0; }).join(' ');
+      } else {
+        if (!tokens.length) {
+          errors.push({ line: lineNo, text: raw.trim(), reason: '缺少课程名称' });
+          return;
+        }
+        name = tokens[0];
+        location = tokens.slice(1).join(' ');
+      }
+
+      var course = sanitizeCourse({
+        id: 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6) + lineNo,
+        name: name,
+        teacher: teacher,
+        location: location,
+        dayOfWeek: dayOfWeek,
+        startTime: startTime,
+        endTime: endTime,
+        weekRule: weekRule
+      });
+      if (!course) {
+        errors.push({ line: lineNo, text: raw.trim(), reason: '信息不完整（需要课程名、星期几、时间、地点）' });
+        return;
+      }
+      courses.push(course);
+    });
+
+    return { courses: courses, errors: errors };
+  }
+
   /* ================= 导出 ================= */
 
   return {
@@ -774,6 +983,9 @@
     timeToMinutes: timeToMinutes,
     minutesToTime: minutesToTime,
     compareByStartTime: compareByStartTime,
+    DEFAULT_PERIOD_TIMES: DEFAULT_PERIOD_TIMES,
+    parsePeriodTable: parsePeriodTable,
+    resolvePeriods: resolvePeriods,
     sanitizeCourse: sanitizeCourse,
     sanitizeOverride: sanitizeOverride,
     overrideForDate: overrideForDate,
@@ -785,6 +997,7 @@
     exportState: exportState,
     parseState: parseState,
     buildICS: buildICS,
-    buildDemoCourses: buildDemoCourses
+    buildDemoCourses: buildDemoCourses,
+    parseScheduleLines: parseScheduleLines
   };
 });

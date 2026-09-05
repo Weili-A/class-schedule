@@ -120,6 +120,13 @@
     return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   }
 
+  // 传给核心函数的 config 必须带上调休/停课数据。
+  // overrides 存放在 state.overrides，而核心从 config.overrides 读取——
+  // 若直接传 state.config，调休/停课会在“今天/周课表”视图静默失效（只有导出日历正常）
+  function coreConfig() {
+    return Object.assign({}, state.config, { overrides: state.overrides });
+  }
+
   /* ================= 渲染：顶栏 ================= */
 
   function renderTop() {
@@ -167,7 +174,7 @@
       return;
     }
 
-    var nn = CORE.getNowNext(state.courses, now, state.config);
+    var nn = CORE.getNowNext(state.courses, now, coreConfig());
 
     if (nn.sched.overriddenBy && nn.sched.overriddenBy.type === 'cancel') {
       el.innerHTML = '<div class="next-label">今天停课</div><div class="next-name">🚫 ' +
@@ -211,7 +218,7 @@
   function renderToday() {
     renderNowCard();
     var now = new Date();
-    var sched = CORE.getDaySchedule(state.courses, CORE.toISO(now), state.config);
+    var sched = CORE.getDaySchedule(state.courses, CORE.toISO(now), coreConfig());
     var week = sched.week;
     var badge = $('today-badge');
     if (Number.isFinite(week) && week >= 1) {
@@ -270,7 +277,7 @@
       return;
     }
 
-    var res = CORE.getWeekSchedule(state.courses, w, state.config);
+    var res = CORE.getWeekSchedule(state.courses, w, coreConfig());
     if (res.error) {
       titleEl.textContent = '出错了';
       rangeEl.textContent = res.error;
@@ -375,6 +382,10 @@
     $('set-total-weeks').value = state.config.totalWeeks;
     $('set-first-week-odd').checked = state.config.firstWeekOdd !== false;
     if ($('ics-alarm')) $('ics-alarm').value = String(state.settings.icsAlarmMinutes || 15);
+    if ($('set-periods')) {
+      $('set-periods').value = (state.settings.periodTimes == null || state.settings.periodTimes === '')
+        ? CORE.DEFAULT_PERIOD_TIMES : state.settings.periodTimes;
+    }
     renderSettingsPreview();
     renderOverrides();
   }
@@ -530,25 +541,31 @@
       };
       var err = parsed.error || CORE.validateCourse(candidate);
       if (err) { toast('⚠️ ' + err); return; }
+      // 统一走 sanitize（时间补零成 HH:MM、去首尾空格、周规则规范化）
+      var clean = CORE.sanitizeCourse(candidate);
+      if (!clean) { toast('⚠️ 课程信息不完整'); return; }
 
-      // 冲突检测：同一天时间重叠的课程提醒确认（防止录错星期/时间）
-      var sMins = CORE.timeToMinutes(startTime);
-      var eMins = CORE.timeToMinutes(endTime);
+      // 冲突检测：同一天时间重叠且周次有交集的课程提醒确认（防止录错星期/时间；
+      // 单双周错开的同一时段不算冲突）
+      var sMins = CORE.timeToMinutes(clean.startTime);
+      var eMins = CORE.timeToMinutes(clean.endTime);
       var clash = null;
       state.courses.forEach(function (x) {
         if (clash || x.id === (c ? c.id : '')) return;
         if (x.dayOfWeek !== selectedDay) return;
         var xs = CORE.timeToMinutes(x.startTime);
         var xe = CORE.timeToMinutes(x.endTime);
-        if (Number.isFinite(xs) && Number.isFinite(xe) && xs < eMins && xe > sMins) clash = x;
+        if (!(Number.isFinite(xs) && Number.isFinite(xe) && xs < eMins && xe > sMins)) return;
+        if (!weeksIntersect(clean.weekRule, x.weekRule)) return;
+        clash = x;
       });
       if (clash && !confirm('⚠️ ' + dayCN(selectedDay) + ' 该时段已有「' + clash.name + '」（' + clash.startTime + '-' + clash.endTime + '），仍要保存吗？')) return;
 
       if (c) {
         var idx = state.courses.indexOf(c);
-        if (idx >= 0) state.courses[idx] = candidate;
+        if (idx >= 0) state.courses[idx] = clean;
       } else {
-        state.courses.push(candidate);
+        state.courses.push(clean);
         // 首次添加课程后提醒一次“添加到主屏幕”以长期保存数据
         if (!state.settings.installNagged) {
           state.settings.installNagged = true;
@@ -559,11 +576,24 @@
           }
         }
       }
-      saveState();
+      if (!saveState()) { toast('⚠️ 保存失败，课程未保存'); renderAll(); return; }
       closeModal();
       toast(c ? '已更新「' + name + '」' : '已添加「' + name + '」');
       renderAll();
     });
+  }
+
+  // 两条周规则在本学期内是否有交集的周次
+  function weeksIntersect(ruleA, ruleB) {
+    var tw = state.config.totalWeeks;
+    var fo = state.config.firstWeekOdd;
+    var wb = CORE.ruleMatchedWeeks(ruleB, tw, fo);
+    if (!wb.length) return false;
+    var wa = CORE.ruleMatchedWeeks(ruleA, tw, fo);
+    for (var i = 0; i < wa.length; i++) {
+      if (wb.indexOf(wa[i]) >= 0) return true;
+    }
+    return false;
   }
 
   /* ---------- 调休/停课编辑 ---------- */
@@ -635,6 +665,68 @@
       saveState();
       closeModal();
       toast('已保存');
+      renderAll();
+    });
+  }
+
+  /* ---------- 批量粘贴导入 ---------- */
+
+  function openBatchImport() {
+    var html =
+      '<h3>📋 批量粘贴导入</h3>' +
+      '<p class="hint" style="margin:0 0 10px">每行一门课：<b>课程名 周一 08:00-09:40 教三201 单周</b><br>' +
+      '时间也可写“第1-2节”（按 设置→作息时间表 换算）；周规则可省略（=每周）；可加“张老师”；也支持“周一 08:00-09:40 高数 教三201 单周”的顺序。</p>' +
+      '<textarea id="bi-text" rows="8" placeholder="高等数学 周二 第1-2节 教三201 1-18周&#10;大学英语 周一 10:00-11:40 外语楼305 双周 李老师&#10;程序设计基础 周三 10:00-11:40 机房B204 前4周"></textarea>' +
+      '<div class="preview-line" id="bi-preview" style="margin-top:10px;white-space:pre-wrap;line-height:1.6"></div>' +
+      '<label class="check-line"><input type="checkbox" id="bi-clear"> 导入前清空现有 ' + state.courses.length + ' 门课程</label>' +
+      '<div class="m-actions">' +
+      '<button class="btn" id="bi-cancel">取消</button>' +
+      '<button class="btn btn-primary" id="bi-ok" disabled>导入</button>' +
+      '</div>';
+
+    var root = openModal(html);
+    var lastResult = { courses: [], errors: [] };
+    var importCfg = {
+      totalWeeks: state.config.totalWeeks,
+      firstWeekOdd: state.config.firstWeekOdd,
+      periodTimes: state.settings.periodTimes
+    };
+
+    function update() {
+      lastResult = CORE.parseScheduleLines($('bi-text').value, importCfg);
+      var el = $('bi-preview');
+      var okBtn = $('bi-ok');
+      var parts = [];
+      lastResult.errors.slice(0, 12).forEach(function (e) {
+        parts.push('✗ 第' + e.line + '行：' + e.reason + '（' + (e.text.length > 18 ? e.text.slice(0, 18) + '…' : e.text) + '）');
+      });
+      if (lastResult.courses.length) {
+        parts.unshift('✓ 可导入 ' + lastResult.courses.length + ' 门课程' +
+          (lastResult.errors.length ? '，' + lastResult.errors.length + ' 行有误（将被跳过）' : ''));
+        el.className = 'preview-line';
+        okBtn.disabled = false;
+        okBtn.textContent = '导入 ' + lastResult.courses.length + ' 门';
+      } else {
+        if (!parts.length) {
+          parts.push('粘贴每行一门课，如：高等数学 周一 08:00-09:40 教三201 单周');
+        }
+        el.className = 'preview-line err';
+        okBtn.disabled = true;
+        okBtn.textContent = '导入';
+      }
+      el.textContent = parts.join('\n');
+    }
+
+    $('bi-text').addEventListener('input', update);
+    update();
+    $('bi-cancel').addEventListener('click', closeModal);
+    $('bi-ok').addEventListener('click', function () {
+      if (!lastResult.courses.length) return;
+      if ($('bi-clear').checked) state.courses = [];
+      lastResult.courses.forEach(function (c) { state.courses.push(c); });
+      if (!saveState()) { toast('⚠️ 保存失败，导入未生效'); return; }
+      closeModal();
+      toast('已导入 ' + lastResult.courses.length + ' 门课程' + (lastResult.errors.length ? '，跳过 ' + lastResult.errors.length + ' 行' : ''));
       renderAll();
     });
   }
@@ -889,6 +981,7 @@
     $('week-today-btn').addEventListener('click', function () { weekOffset = 0; renderWeek(); });
 
     $('course-add').addEventListener('click', function () { openCourseEditor(null); });
+    $('course-batch').addEventListener('click', openBatchImport);
 
     $('course-list').addEventListener('click', function (e) {
       var btn = e.target.closest ? e.target.closest('[data-act]') : null;
@@ -924,6 +1017,15 @@
       renderAll();
     });
     $('set-calibrate').addEventListener('click', openCalibrate);
+
+    $('set-periods').addEventListener('change', function () {
+      var v = String(this.value || '').trim();
+      var table = CORE.parsePeriodTable(v);
+      if (v && !table.length) { toast('⚠️ 作息时间表格式不对：每行如“第1-2节 08:00-09:40”'); return; }
+      state.settings.periodTimes = v;
+      saveState();
+      toast(table.length ? '已保存作息时间表（' + table.length + ' 条）' : '已恢复默认作息时间表');
+    });
 
     $('override-add').addEventListener('click', function () { openOverrideEditor(null); });
     $('override-list').addEventListener('click', function (e) {

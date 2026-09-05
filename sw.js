@@ -6,7 +6,7 @@
 
 // ⚠️ 每次更新应用文件后，把 VERSION 加 1（如 '1' -> '2'），
 // 旧缓存才会在下次激活时被清理，避免离线用户长期使用旧资源
-var VERSION = '1';
+var VERSION = '3';
 var CACHE = 'class-schedule-v' + VERSION;
 var PRECACHE = [
   './',

@@ -10,6 +10,9 @@
   <meta name="apple-mobile-web-app-title" content="课程表">
   <meta name="format-detection" content="telephone=no">
   <meta name="description" content="支持单双周、限周课程的个人课程表：显示每节课时间与地点，离线可用，数据仅存本机">
+  <!-- 纯静态应用无任何外部依赖：CSP 禁止一切第三方脚本/连接，作为纵深防御 -->
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'">
   <title>我的课程表</title>
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icons/icon-192.png">
@@ -59,7 +62,10 @@
     <section id="view-courses" class="view">
       <div class="view-head">
         <h2>全部课程</h2>
-        <button class="btn btn-primary" id="course-add">＋ 添加课程</button>
+        <div style="display:flex;gap:8px;flex:0 0 auto">
+          <button class="btn" id="course-batch" style="width:auto;padding:9px 12px;font-size:13px">📋 批量粘贴</button>
+          <button class="btn btn-primary" id="course-add" style="width:auto;padding:9px 12px;font-size:13px">＋ 添加课程</button>
+        </div>
       </div>
       <div id="course-list"></div>
       <p class="hint" id="course-hint">按“第几周”自动过滤：单周=第1、3、5…周；双周=第2、4、6…周。
@@ -83,6 +89,14 @@
         </label>
         <div class="preview-line" id="set-preview"></div>
         <button class="btn" id="set-calibrate">🎯 校准：告诉我今天是第几周</button>
+      </div>
+
+      <h2 class="section-h">作息时间表（节次 → 时间）</h2>
+      <div class="card form-card">
+        <label class="field">
+          <span>批量粘贴“第X-Y节”课表时按此换算，每行一条，请与学校作息核对</span>
+          <textarea id="set-periods" rows="6" style="font-size:13px;line-height:1.6" spellcheck="false"></textarea>
+        </label>
       </div>
 
       <h2 class="section-h">调休 / 停课</h2>
